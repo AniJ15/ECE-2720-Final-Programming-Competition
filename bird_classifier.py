@@ -171,7 +171,7 @@ def extract_simple_spectral_features(y, sr=44100):
     # Simple frequency band energies (coarser, faster)
     # Divide into 8 bands instead of complex mel filter bank
     n_bands = 8
-    max_freq = sr / 2
+    max_freq = sr_work / 2
     band_edges = np.linspace(0, max_freq, n_bands + 1)
     
     features = []
@@ -224,7 +224,7 @@ def extract_all_features(y, sr=44100):
     return np.concatenate([spectral, temporal, simple_spectral])
 
 
-def load_training_data(data_dir='./kaggle_upload/train', labels_file='./kaggle_upload/train.csv'):
+def load_training_data(data_dir='./kaggle_upload/train/train', labels_file='./kaggle_upload/train.csv'):
     """
     Load training data and labels.
     
@@ -245,17 +245,21 @@ def load_training_data(data_dir='./kaggle_upload/train', labels_file='./kaggle_u
     print("Loading training audio files...")
     train_frames = []
     sample_rates = []
+    missing_files = []
     
-    for i in tqdm(range(20000), desc='Loading audio'):
+    for i in tqdm(range(20000), desc='Loading audio', leave=False):
         filepath = os.path.join(data_dir, f'train_{i}.wav')
         if os.path.exists(filepath):
             sr, frames = wavfile.read(filepath)
             train_frames.append(frames)
             sample_rates.append(sr)
         else:
-            print(f"Warning: {filepath} not found")
+            missing_files.append(i)
             train_frames.append(np.zeros(44100 * 3))  # 3 seconds at 44.1kHz
             sample_rates.append(44100)
+    
+    if missing_files:
+        print(f"Warning: {len(missing_files)} training files not found (e.g., train_{missing_files[0]}.wav)")
     
     print("Loading training labels...")
     with open(labels_file, 'r') as f:
@@ -266,7 +270,7 @@ def load_training_data(data_dir='./kaggle_upload/train', labels_file='./kaggle_u
     
     print("Extracting features...")
     train_features = []
-    for i, frames in enumerate(tqdm(train_frames, desc='Extracting features')):
+    for i, frames in enumerate(tqdm(train_frames, desc='Extracting features', leave=False)):
         features = extract_all_features(frames, sr=sample_rates[i])
         train_features.append(features)
     
@@ -276,7 +280,7 @@ def load_training_data(data_dir='./kaggle_upload/train', labels_file='./kaggle_u
     return X, y
 
 
-def load_test_data(data_dir='./kaggle_upload/test'):
+def load_test_data(data_dir='./kaggle_upload/test/test'):
     """
     Load test data.
     
@@ -293,21 +297,25 @@ def load_test_data(data_dir='./kaggle_upload/test'):
     print("Loading test audio files...")
     test_frames = []
     sample_rates = []
+    missing_files = []
     
-    for i in tqdm(range(4000), desc='Loading audio'):
+    for i in tqdm(range(4000), desc='Loading audio', leave=False):
         filepath = os.path.join(data_dir, f'test_{i}.wav')
         if os.path.exists(filepath):
             sr, frames = wavfile.read(filepath)
             test_frames.append(frames)
             sample_rates.append(sr)
         else:
-            print(f"Warning: {filepath} not found")
+            missing_files.append(i)
             test_frames.append(np.zeros(44100 * 3))
             sample_rates.append(44100)
     
+    if missing_files:
+        print(f"Warning: {len(missing_files)} test files not found (e.g., test_{missing_files[0]}.wav)")
+    
     print("Extracting features...")
     test_features = []
-    for i, frames in enumerate(tqdm(test_frames, desc='Extracting features')):
+    for i, frames in enumerate(tqdm(test_frames, desc='Extracting features', leave=False)):
         features = extract_all_features(frames, sr=sample_rates[i])
         test_features.append(features)
     
@@ -352,11 +360,11 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
         best_model = None
         best_C = None
         
+        print("  Tuning C parameter...")
         for C in [0.1, 1, 10, 100, 1000]:
-            model = svm.SVC(kernel='rbf', C=C, gamma='scale', random_state=42)
+            model = svm.SVC(kernel='rbf', C=C, gamma='scale', random_state=42, verbose=False)
             model.fit(X_train_scaled, y_train)
             score = model.score(X_val_scaled, y_val)
-            print(f"  C={C}: Validation accuracy = {score:.4f}")
             if score > best_score:
                 best_score = score
                 best_model = model
@@ -371,11 +379,11 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
         best_model = None
         best_k = None
         
+        print("  Tuning k parameter...")
         for k in [3, 5, 7, 9, 11, 15, 20, 25]:
             model = neighbors.KNeighborsClassifier(n_neighbors=k, weights='distance')
             model.fit(X_train_scaled, y_train)
             score = model.score(X_val_scaled, y_val)
-            print(f"  k={k}: Validation accuracy = {score:.4f}")
             if score > best_score:
                 best_score = score
                 best_model = model
@@ -385,19 +393,21 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
         model = best_model
         
     elif model_type == 'rf':
+        print("  Training Random Forest...")
         model = RandomForestClassifier(n_estimators=200, max_depth=30, 
-                                      random_state=42, n_jobs=-1)
+                                      random_state=42, n_jobs=-1, verbose=0)
         model.fit(X_train_scaled, y_train)
         score = model.score(X_val_scaled, y_val)
         print(f"  Validation accuracy = {score:.4f}")
         
     elif model_type == 'ensemble':
         # Ensemble of multiple models
+        print("  Training ensemble (SVM + KNN + RF)...")
         svm_model = svm.SVC(kernel='rbf', C=100, gamma='scale', 
-                           probability=True, random_state=42)
+                           probability=True, random_state=42, verbose=False)
         knn_model = neighbors.KNeighborsClassifier(n_neighbors=11, weights='distance')
         rf_model = RandomForestClassifier(n_estimators=200, max_depth=30, 
-                                         random_state=42, n_jobs=-1)
+                                         random_state=42, n_jobs=-1, verbose=0)
         
         ensemble = VotingClassifier(
             estimators=[('svm', svm_model), ('knn', knn_model), ('rf', rf_model)],
