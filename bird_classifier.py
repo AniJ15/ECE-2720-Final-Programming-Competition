@@ -10,7 +10,10 @@ from sklearn import model_selection
 from sklearn import preprocessing
 from sklearn import neighbors
 from sklearn import svm
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
 import pickle
 
 
@@ -67,9 +70,27 @@ def extract_spectral_features(y, sr=44100):
     
     features.extend([spectral_centroid, spectral_bandwidth])
     
+    # Spectral rolloff (frequency below which 85% of energy is contained)
+    cumsum_magnitude = np.cumsum(magnitude)
+    rolloff_threshold = 0.85 * cumsum_magnitude[-1] if len(cumsum_magnitude) > 0 else 0
+    rolloff_idx = np.where(cumsum_magnitude >= rolloff_threshold)[0]
+    if len(rolloff_idx) > 0:
+        spectral_rolloff = freqs[rolloff_idx[0]]
+    else:
+        spectral_rolloff = freqs[-1] if len(freqs) > 0 else 0
+    features.append(spectral_rolloff)
+    
     # Dominant frequency
-    dominant_freq = freqs[np.argmax(magnitude)]
+    dominant_freq = freqs[np.argmax(magnitude)] if len(magnitude) > 0 else 0
     features.append(dominant_freq)
+    
+    # Top 3 peak frequencies (important for bird calls)
+    if len(magnitude) > 3:
+        peak_indices = np.argsort(magnitude)[-3:][::-1]
+        top_freqs = freqs[peak_indices]
+        features.extend(top_freqs.tolist())
+    else:
+        features.extend([0, 0, 0])
     
     # Energy in frequency bands (vectorized, faster)
     freq_mask_1 = (freqs >= 0) & (freqs < 1000)
@@ -135,6 +156,13 @@ def extract_temporal_features(y):
     energy = np.sum(y_work**2)
     features.append(energy)
     
+    # Additional temporal features
+    # Variance of amplitude
+    features.append(np.var(y_work))
+    
+    # Mean absolute deviation
+    features.append(np.mean(np.abs(y_work - np.mean(y_work))))
+    
     return np.array(features)
 
 
@@ -191,6 +219,17 @@ def extract_simple_spectral_features(y, sr=44100):
     else:
         spectral_flatness = 0
     features.append(spectral_flatness)
+    
+    # Spectral contrast (difference between peaks and valleys)
+    if len(magnitude) > 10:
+        # Simple spectral contrast: difference between mean of top 10% and bottom 10%
+        sorted_mag = np.sort(magnitude)
+        top_10 = np.mean(sorted_mag[-len(sorted_mag)//10:])
+        bottom_10 = np.mean(sorted_mag[:len(sorted_mag)//10])
+        spectral_contrast = top_10 - bottom_10 if bottom_10 > 0 else 0
+        features.append(spectral_contrast)
+    else:
+        features.append(0)
     
     return np.array(features)
 
@@ -323,7 +362,7 @@ def load_test_data(data_dir='./kaggle_upload/test/test'):
     return X
 
 
-def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
+def train_model(X_train, y_train, X_val, y_val, model_type='svm', use_feature_selection=False):
     """
     Train a classifier model.
     
@@ -338,7 +377,9 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
     y_val : ndarray
         Validation labels
     model_type : str
-        Type of model ('svm', 'knn', 'rf', 'ensemble')
+        Type of model ('svm', 'knn', 'rf', 'gbm', 'lr', 'ensemble')
+    use_feature_selection : bool
+        Whether to use feature selection (keeps top 80% of features)
     
     Returns:
     --------
@@ -346,6 +387,8 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
         Trained model
     scaler : sklearn scaler
         Fitted scaler
+    feature_selector : sklearn feature selector or None
+        Feature selector if used
     """
     print(f"\nTraining {model_type.upper()} model...")
     
@@ -353,6 +396,15 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
     scaler = preprocessing.StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
+    
+    # Optional feature selection
+    feature_selector = None
+    if use_feature_selection and X_train_scaled.shape[1] > 20:
+        k_best = max(int(0.8 * X_train_scaled.shape[1]), 20)  # Keep top 80% or at least 20 features
+        feature_selector = SelectKBest(f_classif, k=k_best)
+        X_train_scaled = feature_selector.fit_transform(X_train_scaled, y_train)
+        X_val_scaled = feature_selector.transform(X_val_scaled)
+        print(f"  Selected {X_train_scaled.shape[1]} features out of {X_train.shape[1]}")
     
     if model_type == 'svm':
         # Tune C parameter
@@ -393,25 +445,76 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
         model = best_model
         
     elif model_type == 'rf':
-        print("  Training Random Forest...")
-        model = RandomForestClassifier(n_estimators=200, max_depth=30, 
-                                      random_state=42, n_jobs=-1, verbose=0)
+        print("  Tuning Random Forest...")
+        best_score = 0
+        best_model = None
+        best_params = None
+        
+        # Try different configurations
+        for n_est in [100, 200, 300]:
+            for max_d in [20, 30, 40]:
+                model = RandomForestClassifier(n_estimators=n_est, max_depth=max_d,
+                                              random_state=42, n_jobs=-1, verbose=0)
+                model.fit(X_train_scaled, y_train)
+                score = model.score(X_val_scaled, y_val)
+                if score > best_score:
+                    best_score = score
+                    best_model = model
+                    best_params = (n_est, max_d)
+        
+        print(f"  Best params (n_est={best_params[0]}, max_d={best_params[1]}) with validation accuracy = {best_score:.4f}")
+        model = best_model
+        
+    elif model_type == 'gbm':
+        print("  Training Gradient Boosting...")
+        model = GradientBoostingClassifier(n_estimators=100, max_depth=5, 
+                                           learning_rate=0.1, random_state=42, verbose=0)
         model.fit(X_train_scaled, y_train)
         score = model.score(X_val_scaled, y_val)
         print(f"  Validation accuracy = {score:.4f}")
         
+    elif model_type == 'lr':
+        print("  Tuning Logistic Regression...")
+        best_score = 0
+        best_model = None
+        best_C = None
+        
+        for C in [0.01, 0.1, 1, 10, 100]:
+            model = LogisticRegression(C=C, max_iter=1000, random_state=42, n_jobs=-1)
+            model.fit(X_train_scaled, y_train)
+            score = model.score(X_val_scaled, y_val)
+            if score > best_score:
+                best_score = score
+                best_model = model
+                best_C = C
+        
+        print(f"  Best C={best_C} with validation accuracy = {best_score:.4f}")
+        model = best_model
+        
     elif model_type == 'ensemble':
-        # Ensemble of multiple models
-        print("  Training ensemble (SVM + KNN + RF)...")
+        # Enhanced ensemble with more diverse models
+        print("  Training enhanced ensemble (SVM + KNN + RF + GBM + LR)...")
+        
+        # Get best hyperparameters from individual models (or use reasonable defaults)
         svm_model = svm.SVC(kernel='rbf', C=100, gamma='scale', 
                            probability=True, random_state=42, verbose=False)
         knn_model = neighbors.KNeighborsClassifier(n_neighbors=11, weights='distance')
         rf_model = RandomForestClassifier(n_estimators=200, max_depth=30, 
                                          random_state=42, n_jobs=-1, verbose=0)
+        gbm_model = GradientBoostingClassifier(n_estimators=100, max_depth=5,
+                                               learning_rate=0.1, random_state=42, verbose=0)
+        lr_model = LogisticRegression(C=10, max_iter=1000, random_state=42, n_jobs=-1)
         
         ensemble = VotingClassifier(
-            estimators=[('svm', svm_model), ('knn', knn_model), ('rf', rf_model)],
-            voting='soft'
+            estimators=[
+                ('svm', svm_model), 
+                ('knn', knn_model), 
+                ('rf', rf_model),
+                ('gbm', gbm_model),
+                ('lr', lr_model)
+            ],
+            voting='soft',
+            weights=None  # Equal weights, can be tuned
         )
         ensemble.fit(X_train_scaled, y_train)
         score = ensemble.score(X_val_scaled, y_val)
@@ -425,10 +528,10 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm'):
     val_score = model.score(X_val_scaled, y_val)
     print(f"  Final - Train accuracy: {train_score:.4f}, Val accuracy: {val_score:.4f}")
     
-    return model, scaler
+    return model, scaler, feature_selector
 
 
-def make_predictions(model, scaler, X_test, output_file='submission.csv'):
+def make_predictions(model, scaler, X_test, output_file='submission.csv', feature_selector=None):
     """
     Make predictions on test set and save to CSV.
     
@@ -442,9 +545,13 @@ def make_predictions(model, scaler, X_test, output_file='submission.csv'):
         Test features
     output_file : str
         Output CSV file path
+    feature_selector : sklearn feature selector or None
+        Feature selector if used during training
     """
     print("\nMaking predictions on test set...")
     X_test_scaled = scaler.transform(X_test)
+    if feature_selector is not None:
+        X_test_scaled = feature_selector.transform(X_test_scaled)
     predictions = model.predict(X_test_scaled)
     
     ids = np.arange(0, predictions.shape[0])
@@ -471,27 +578,44 @@ if __name__ == '__main__':
     print(f"\nTrain set: {X_train.shape}, Validation set: {X_val.shape}")
     
     # Train model (try different models)
-    model_types = ['svm', 'knn', 'rf', 'ensemble']
+    # Start with ensemble as it usually performs best
+    model_types = ['ensemble', 'svm', 'knn', 'rf', 'gbm', 'lr']
     
     best_model = None
     best_scaler = None
+    best_feature_selector = None
     best_score = 0
     best_type = None
     
     for model_type in model_types:
         try:
-            model, scaler = train_model(X_train, y_train, X_val, y_val, model_type=model_type)
-            score = model.score(scaler.transform(X_val), y_val)
+            # Try without feature selection first
+            model, scaler, feature_selector = train_model(
+                X_train, y_train, X_val, y_val, 
+                model_type=model_type, 
+                use_feature_selection=False
+            )
+            
+            # Score with proper feature selection
+            X_val_scaled = scaler.transform(X_val)
+            if feature_selector is not None:
+                X_val_scaled = feature_selector.transform(X_val_scaled)
+            score = model.score(X_val_scaled, y_val)
             
             if score > best_score:
                 best_score = score
                 best_model = model
                 best_scaler = scaler
+                best_feature_selector = feature_selector
                 best_type = model_type
             
             # Save model
             with open(f'model_{model_type}.pkl', 'wb') as f:
-                pickle.dump({'model': model, 'scaler': scaler}, f)
+                pickle.dump({
+                    'model': model, 
+                    'scaler': scaler, 
+                    'feature_selector': feature_selector
+                }, f)
             print(f"Model saved to model_{model_type}.pkl\n")
             
         except Exception as e:
@@ -501,7 +625,7 @@ if __name__ == '__main__':
     
     # Load test data and make predictions
     X_test = load_test_data()
-    make_predictions(best_model, best_scaler, X_test, 'submission.csv')
+    make_predictions(best_model, best_scaler, X_test, 'submission.csv', best_feature_selector)
     
     print(f"\nTotal time: {time.time() - start_time:.2f}s")
 
