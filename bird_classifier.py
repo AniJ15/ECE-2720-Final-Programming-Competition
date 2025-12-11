@@ -14,6 +14,7 @@ from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientB
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import GridSearchCV
 import pickle
 
 
@@ -408,228 +409,382 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm', use_feature_se
         print(f"  Selected {X_train_scaled.shape[1]} features out of {X_train.shape[1]} (reducing overfitting)")
     
     if model_type == 'svm':
-        # Tune C parameter with overfitting prevention
-        best_score = 0
-        best_model = None
-        best_C = None
-        
-        print("  Tuning C parameter (preventing overfitting)...")
-        for C in [0.1, 1, 10, 100, 1000]:
-            model = svm.SVC(kernel='rbf', C=C, gamma='scale', random_state=42, verbose=False)
-            model.fit(X_train_scaled, y_train)
-            val_score = model.score(X_val_scaled, y_val)
-            train_score = model.score(X_train_scaled, y_train)
-            
-            # Penalize large train-val gap (overfitting indicator)
-            gap = train_score - val_score
-            combined_score = val_score - 0.2 * gap
-            
-            if combined_score > best_score:
-                best_score = combined_score
-                best_model = model
-                best_C = C
-        
-        train_acc = best_model.score(X_train_scaled, y_train)
-        val_acc = best_model.score(X_val_scaled, y_val)
-        print(f"  Best C={best_C} with validation accuracy = {val_acc:.4f}")
-        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
-        model = best_model
-        
-    elif model_type == 'knn':
-        # Tune k parameter with overfitting prevention
-        # Use cross-validation and higher minimum k to prevent overfitting
-        best_score = 0
-        best_model = None
-        best_k = None
-        best_weights = None
-        
-        print("  Tuning k parameter with cross-validation (preventing overfitting)...")
-        # Start from k=7 (higher minimum to prevent overfitting)
-        # Use cross-validation for more robust hyperparameter selection
-        k_values = [7, 9, 11, 13, 15, 17, 20, 25, 30, 35]
-        weight_options = ['distance', 'uniform']  # Try both
-        
-        for weights in weight_options:
-            for k in k_values:
-                model = neighbors.KNeighborsClassifier(
-                    n_neighbors=k, 
-                    weights=weights,
-                    leaf_size=30,  # Larger leaf size for faster computation and less overfitting
-                    algorithm='auto'
-                )
-                # Use cross-validation score for more robust evaluation
-                cv_scores = model_selection.cross_val_score(
-                    model, X_train_scaled, y_train, 
-                    cv=3, scoring='accuracy', n_jobs=-1
-                )
-                cv_mean = cv_scores.mean()
-                
-                # Also check validation set
-                model.fit(X_train_scaled, y_train)
-                val_score = model.score(X_val_scaled, y_val)
-                
-                # Prefer models with good CV score and reasonable train-val gap
-                # Penalize if train accuracy is much higher than val (overfitting)
-                train_score = model.score(X_train_scaled, y_train)
-                gap = train_score - val_score
-                
-                # Combined score: prefer good validation with small gap
-                combined_score = val_score - 0.3 * gap  # Penalize large gaps
-                
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_model = model
-                    best_k = k
-                    best_weights = weights
-        
-        print(f"  Best k={best_k}, weights={best_weights} with validation accuracy = {best_model.score(X_val_scaled, y_val):.4f}")
-        train_acc = best_model.score(X_train_scaled, y_train)
-        val_acc = best_model.score(X_val_scaled, y_val)
-        print(f"  Train accuracy: {train_acc:.4f}, Val accuracy: {val_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
-        model = best_model
-        
-    elif model_type == 'rf':
-        print("  Tuning Random Forest (preventing overfitting)...")
+        # Comprehensive SVM tuning with multiple parameters
+        print("  Comprehensive SVM tuning (C, gamma, kernel)...")
         best_score = 0
         best_model = None
         best_params = None
         
-        # Try different configurations with regularization
-        for n_est in [100, 200, 300]:
-            for max_d in [15, 20, 25, 30]:  # Reduced max depth to prevent overfitting
-                model = RandomForestClassifier(
-                    n_estimators=n_est, 
-                    max_depth=max_d,
-                    min_samples_split=5,  # Require more samples to split (regularization)
-                    min_samples_leaf=2,    # Require minimum samples in leaf
-                    max_features='sqrt',    # Use sqrt features (regularization)
-                    random_state=42, 
-                    n_jobs=-1, 
-                    verbose=0
-                )
-                model.fit(X_train_scaled, y_train)
-                val_score = model.score(X_val_scaled, y_val)
-                train_score = model.score(X_train_scaled, y_train)
-                
-                # Penalize large train-val gap
-                gap = train_score - val_score
-                combined_score = val_score - 0.2 * gap
-                
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_model = model
-                    best_params = (n_est, max_d)
+        # Try different kernels and parameters
+        param_grids = [
+            {'kernel': ['rbf'], 'C': [0.1, 1, 10, 100], 'gamma': ['scale', 'auto', 0.001, 0.01, 0.1]},
+            {'kernel': ['poly'], 'C': [0.1, 1, 10], 'gamma': ['scale', 'auto'], 'degree': [2, 3]},
+            {'kernel': ['sigmoid'], 'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.001, 0.01]}
+        ]
+        
+        for param_grid in param_grids:
+            for params in model_selection.ParameterGrid(param_grid):
+                try:
+                    model = svm.SVC(**params, random_state=42, verbose=False, probability=True)
+                    model.fit(X_train_scaled, y_train)
+                    val_score = model.score(X_val_scaled, y_val)
+                    train_score = model.score(X_train_scaled, y_train)
+                    
+                    # Penalize large train-val gap
+                    gap = train_score - val_score
+                    combined_score = val_score - 0.2 * gap
+                    
+                    if combined_score > best_score:
+                        best_score = combined_score
+                        best_model = model
+                        best_params = params
+                except:
+                    continue
         
         train_acc = best_model.score(X_train_scaled, y_train)
         val_acc = best_model.score(X_val_scaled, y_val)
-        print(f"  Best params (n_est={best_params[0]}, max_d={best_params[1]}) with validation accuracy = {val_acc:.4f}")
+        print(f"  Best params: {best_params} with validation accuracy = {val_acc:.4f}")
+        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
+        model = best_model
+        
+    elif model_type == 'knn':
+        # Comprehensive KNN tuning
+        print("  Comprehensive KNN tuning (k, weights, metric, algorithm)...")
+        best_score = 0
+        best_model = None
+        best_params = None
+        
+        # Comprehensive parameter search
+        k_values = [5, 7, 9, 11, 13, 15, 17, 20, 25, 30]
+        weight_options = ['distance', 'uniform']
+        metrics = ['euclidean', 'manhattan', 'minkowski']
+        algorithms = ['auto', 'ball_tree', 'kd_tree']
+        
+        for weights in weight_options:
+            for metric in metrics:
+                for algorithm in algorithms:
+                    for k in k_values:
+                        try:
+                            model = neighbors.KNeighborsClassifier(
+                                n_neighbors=k,
+                                weights=weights,
+                                metric=metric,
+                                algorithm=algorithm,
+                                leaf_size=30
+                            )
+                            # Use cross-validation for robust evaluation
+                            cv_scores = model_selection.cross_val_score(
+                                model, X_train_scaled, y_train,
+                                cv=3, scoring='accuracy', n_jobs=-1
+                            )
+                            cv_mean = cv_scores.mean()
+                            
+                            model.fit(X_train_scaled, y_train)
+                            val_score = model.score(X_val_scaled, y_val)
+                            train_score = model.score(X_train_scaled, y_train)
+                            
+                            gap = train_score - val_score
+                            # Combine CV score and validation score, penalize gap
+                            combined_score = 0.4 * cv_mean + 0.6 * val_score - 0.3 * gap
+                            
+                            if combined_score > best_score:
+                                best_score = combined_score
+                                best_model = model
+                                best_params = {'k': k, 'weights': weights, 'metric': metric, 'algorithm': algorithm}
+                        except:
+                            continue
+        
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Best params: {best_params} with validation accuracy = {val_acc:.4f}")
+        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
+        model = best_model
+        
+    elif model_type == 'rf':
+        print("  Comprehensive Random Forest tuning...")
+        best_score = 0
+        best_model = None
+        best_params = None
+        
+        # Comprehensive parameter search
+        for n_est in [100, 200, 300, 400]:
+            for max_d in [15, 20, 25, 30, None]:  # None = no limit
+                for min_split in [2, 5, 10]:
+                    for min_leaf in [1, 2, 4]:
+                        for max_feat in ['sqrt', 'log2', 0.5]:
+                            try:
+                                model = RandomForestClassifier(
+                                    n_estimators=n_est,
+                                    max_depth=max_d,
+                                    min_samples_split=min_split,
+                                    min_samples_leaf=min_leaf,
+                                    max_features=max_feat,
+                                    random_state=42,
+                                    n_jobs=-1,
+                                    verbose=0
+                                )
+                                model.fit(X_train_scaled, y_train)
+                                val_score = model.score(X_val_scaled, y_val)
+                                train_score = model.score(X_train_scaled, y_train)
+                                
+                                gap = train_score - val_score
+                                combined_score = val_score - 0.2 * gap
+                                
+                                if combined_score > best_score:
+                                    best_score = combined_score
+                                    best_model = model
+                                    best_params = {
+                                        'n_est': n_est, 'max_d': max_d,
+                                        'min_split': min_split, 'min_leaf': min_leaf,
+                                        'max_feat': max_feat
+                                    }
+                            except:
+                                continue
+        
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Best params: {best_params} with validation accuracy = {val_acc:.4f}")
         print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
         model = best_model
         
     elif model_type == 'gbm':
-        print("  Training Gradient Boosting (with early stopping to prevent overfitting)...")
-        # Use validation set for early stopping
-        model = GradientBoostingClassifier(
-            n_estimators=200,  # Start with more, will stop early
-            max_depth=4,       # Reduced depth to prevent overfitting
-            learning_rate=0.05,  # Lower learning rate for better generalization
-            min_samples_split=5,
-            min_samples_leaf=2,
-            subsample=0.8,     # Use 80% of samples (regularization)
-            max_features='sqrt',
-            validation_fraction=0.1,  # Use 10% for validation
-            n_iter_no_change=10,  # Stop if no improvement for 10 iterations
-            random_state=42, 
-            verbose=0
-        )
-        model.fit(X_train_scaled, y_train)
-        train_score = model.score(X_train_scaled, y_train)
-        val_score = model.score(X_val_scaled, y_val)
-        print(f"  Validation accuracy = {val_score:.4f}")
-        print(f"  Train accuracy: {train_score:.4f}, Gap: {train_score - val_score:.4f}")
-        
-    elif model_type == 'lr':
-        print("  Tuning Logistic Regression (with regularization)...")
+        print("  Comprehensive Gradient Boosting tuning...")
         best_score = 0
         best_model = None
-        best_C = None
+        best_params = None
         
-        # Try different regularization strengths (lower C = more regularization)
-        for C in [0.01, 0.1, 1, 10, 100]:
-            model = LogisticRegression(
-                C=C, 
-                max_iter=1000, 
-                penalty='l2',  # L2 regularization
-                random_state=42, 
-                n_jobs=-1
-            )
-            model.fit(X_train_scaled, y_train)
-            val_score = model.score(X_val_scaled, y_val)
-            train_score = model.score(X_train_scaled, y_train)
-            
-            # Prefer models with good validation and small gap
-            gap = train_score - val_score
-            combined_score = val_score - 0.2 * gap
-            
-            if combined_score > best_score:
-                best_score = combined_score
-                best_model = model
-                best_C = C
+        # Comprehensive parameter search
+        for n_est in [100, 200, 300]:
+            for max_d in [3, 4, 5, 6]:
+                for lr in [0.01, 0.05, 0.1]:
+                    for subsample in [0.8, 0.9, 1.0]:
+                        for min_split in [2, 5, 10]:
+                            try:
+                                model = GradientBoostingClassifier(
+                                    n_estimators=n_est,
+                                    max_depth=max_d,
+                                    learning_rate=lr,
+                                    min_samples_split=min_split,
+                                    min_samples_leaf=2,
+                                    subsample=subsample,
+                                    max_features='sqrt',
+                                    validation_fraction=0.1,
+                                    n_iter_no_change=10,
+                                    random_state=42,
+                                    verbose=0
+                                )
+                                model.fit(X_train_scaled, y_train)
+                                val_score = model.score(X_val_scaled, y_val)
+                                train_score = model.score(X_train_scaled, y_train)
+                                
+                                gap = train_score - val_score
+                                combined_score = val_score - 0.2 * gap
+                                
+                                if combined_score > best_score:
+                                    best_score = combined_score
+                                    best_model = model
+                                    best_params = {
+                                        'n_est': n_est, 'max_d': max_d,
+                                        'lr': lr, 'subsample': subsample,
+                                        'min_split': min_split
+                                    }
+                            except:
+                                continue
         
         train_acc = best_model.score(X_train_scaled, y_train)
         val_acc = best_model.score(X_val_scaled, y_val)
-        print(f"  Best C={best_C} with validation accuracy = {val_acc:.4f}")
+        print(f"  Best params: {best_params} with validation accuracy = {val_acc:.4f}")
+        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
+        model = best_model
+        
+    elif model_type == 'lr':
+        print("  Comprehensive Logistic Regression tuning...")
+        best_score = 0
+        best_model = None
+        best_params = None
+        
+        # Try different regularization types and strengths
+        for C in [0.001, 0.01, 0.1, 1, 10, 100]:
+            for penalty in ['l1', 'l2']:
+                for solver in ['liblinear', 'lbfgs', 'saga']:
+                    # Check solver compatibility
+                    if penalty == 'l1' and solver not in ['liblinear', 'saga']:
+                        continue
+                    if penalty == 'l2' and solver == 'liblinear':
+                        continue
+                    
+                    try:
+                        model = LogisticRegression(
+                            C=C,
+                            penalty=penalty,
+                            solver=solver,
+                            max_iter=2000,
+                            random_state=42,
+                            n_jobs=-1
+                        )
+                        model.fit(X_train_scaled, y_train)
+                        val_score = model.score(X_val_scaled, y_val)
+                        train_score = model.score(X_train_scaled, y_train)
+                        
+                        gap = train_score - val_score
+                        combined_score = val_score - 0.2 * gap
+                        
+                        if combined_score > best_score:
+                            best_score = combined_score
+                            best_model = model
+                            best_params = {'C': C, 'penalty': penalty, 'solver': solver}
+                    except:
+                        continue
+        
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Best params: {best_params} with validation accuracy = {val_acc:.4f}")
         print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
         model = best_model
         
     elif model_type == 'ensemble':
-        # Enhanced ensemble with more diverse models (regularized to prevent overfitting)
-        print("  Training enhanced ensemble (SVM + KNN + RF + GBM + LR) with overfitting prevention...")
+        # Weighted ensemble based on individual model performance
+        print("  Training weighted ensemble - optimizing individual models first...")
         
-        # Use regularized models to prevent overfitting
-        svm_model = svm.SVC(kernel='rbf', C=10, gamma='scale',  # Lower C for regularization
-                           probability=True, random_state=42, verbose=False)
-        # Use higher k for KNN in ensemble to prevent overfitting
-        knn_model = neighbors.KNeighborsClassifier(
-            n_neighbors=15,  # Higher k to prevent overfitting
-            weights='uniform',  # Uniform weights are less prone to overfitting
-            leaf_size=30
-        )
-        rf_model = RandomForestClassifier(
-            n_estimators=200, 
-            max_depth=25,  # Reduced depth
-            min_samples_split=5,
-            min_samples_leaf=2,
-            max_features='sqrt',
-            random_state=42, 
-            n_jobs=-1, 
-            verbose=0
-        )
-        gbm_model = GradientBoostingClassifier(
-            n_estimators=100, 
-            max_depth=4,  # Reduced depth
-            learning_rate=0.05,
-            subsample=0.8,
-            min_samples_split=5,
-            random_state=42, 
-            verbose=0
-        )
-        lr_model = LogisticRegression(C=1, max_iter=1000, random_state=42, n_jobs=-1)  # Lower C
+        # Train each model individually to get their performance
+        individual_models = {}
+        individual_scores = {}
         
+        print("    Training individual models for ensemble...")
+        
+        # Train SVM
+        print("    - Training SVM...")
+        svm_best = None
+        svm_best_score = 0
+        for C in [1, 10, 100]:
+            for gamma in ['scale', 'auto', 0.01]:
+                try:
+                    m = svm.SVC(kernel='rbf', C=C, gamma=gamma, probability=True, 
+                               random_state=42, verbose=False)
+                    m.fit(X_train_scaled, y_train)
+                    score = m.score(X_val_scaled, y_val)
+                    if score > svm_best_score:
+                        svm_best_score = score
+                        svm_best = m
+                except:
+                    continue
+        individual_models['svm'] = svm_best
+        individual_scores['svm'] = svm_best_score
+        print(f"      SVM validation accuracy: {svm_best_score:.4f}")
+        
+        # Train KNN
+        print("    - Training KNN...")
+        knn_best = None
+        knn_best_score = 0
+        for k in [11, 15, 20, 25]:
+            for weights in ['distance', 'uniform']:
+                try:
+                    m = neighbors.KNeighborsClassifier(n_neighbors=k, weights=weights, leaf_size=30)
+                    m.fit(X_train_scaled, y_train)
+                    score = m.score(X_val_scaled, y_val)
+                    if score > knn_best_score:
+                        knn_best_score = score
+                        knn_best = m
+                except:
+                    continue
+        individual_models['knn'] = knn_best
+        individual_scores['knn'] = knn_best_score
+        print(f"      KNN validation accuracy: {knn_best_score:.4f}")
+        
+        # Train RF
+        print("    - Training Random Forest...")
+        rf_best = None
+        rf_best_score = 0
+        for n_est in [200, 300]:
+            for max_d in [20, 25, 30]:
+                try:
+                    m = RandomForestClassifier(n_estimators=n_est, max_depth=max_d,
+                                              min_samples_split=5, min_samples_leaf=2,
+                                              max_features='sqrt', random_state=42,
+                                              n_jobs=-1, verbose=0)
+                    m.fit(X_train_scaled, y_train)
+                    score = m.score(X_val_scaled, y_val)
+                    if score > rf_best_score:
+                        rf_best_score = score
+                        rf_best = m
+                except:
+                    continue
+        individual_models['rf'] = rf_best
+        individual_scores['rf'] = rf_best_score
+        print(f"      RF validation accuracy: {rf_best_score:.4f}")
+        
+        # Train GBM
+        print("    - Training Gradient Boosting...")
+        gbm_best = None
+        gbm_best_score = 0
+        for n_est in [100, 200]:
+            for max_d in [4, 5]:
+                for lr in [0.05, 0.1]:
+                    try:
+                        m = GradientBoostingClassifier(n_estimators=n_est, max_depth=max_d,
+                                                      learning_rate=lr, subsample=0.8,
+                                                      min_samples_split=5, random_state=42, verbose=0)
+                        m.fit(X_train_scaled, y_train)
+                        score = m.score(X_val_scaled, y_val)
+                        if score > gbm_best_score:
+                            gbm_best_score = score
+                            gbm_best = m
+                    except:
+                        continue
+        individual_models['gbm'] = gbm_best
+        individual_scores['gbm'] = gbm_best_score
+        print(f"      GBM validation accuracy: {gbm_best_score:.4f}")
+        
+        # Train LR
+        print("    - Training Logistic Regression...")
+        lr_best = None
+        lr_best_score = 0
+        for C in [0.1, 1, 10]:
+            try:
+                m = LogisticRegression(C=C, max_iter=2000, random_state=42, n_jobs=-1)
+                m.fit(X_train_scaled, y_train)
+                score = m.score(X_val_scaled, y_val)
+                if score > lr_best_score:
+                    lr_best_score = score
+                    lr_best = m
+            except:
+                continue
+        individual_models['lr'] = lr_best
+        individual_scores['lr'] = lr_best_score
+        print(f"      LR validation accuracy: {lr_best_score:.4f}")
+        
+        # Calculate weights based on validation performance
+        # Use exponential weighting to emphasize better models
+        min_score = min(individual_scores.values())
+        max_score = max(individual_scores.values())
+        
+        # Normalize scores and apply exponential weighting
+        if max_score > min_score:
+            normalized_scores = {k: (v - min_score) / (max_score - min_score) for k, v in individual_scores.items()}
+            # Exponential weighting: better models get much higher weights
+            weights = [np.exp(3 * normalized_scores[k]) for k in ['svm', 'knn', 'rf', 'gbm', 'lr']]
+            # Normalize weights to sum to number of models
+            weights = np.array(weights) * len(weights) / np.sum(weights)
+        else:
+            weights = [1, 1, 1, 1, 1]  # Equal weights if all perform similarly
+        
+        print(f"    Model weights: SVM={weights[0]:.2f}, KNN={weights[1]:.2f}, RF={weights[2]:.2f}, GBM={weights[3]:.2f}, LR={weights[4]:.2f}")
+        
+        # Create weighted ensemble
         ensemble = VotingClassifier(
             estimators=[
-                ('svm', svm_model), 
-                ('knn', knn_model), 
-                ('rf', rf_model),
-                ('gbm', gbm_model),
-                ('lr', lr_model)
+                ('svm', individual_models['svm']),
+                ('knn', individual_models['knn']),
+                ('rf', individual_models['rf']),
+                ('gbm', individual_models['gbm']),
+                ('lr', individual_models['lr'])
             ],
             voting='soft',
-            weights=None  # Equal weights, can be tuned
+            weights=weights.tolist()
         )
         ensemble.fit(X_train_scaled, y_train)
         score = ensemble.score(X_val_scaled, y_val)
-        print(f"  Validation accuracy = {score:.4f}")
+        print(f"  Weighted ensemble validation accuracy = {score:.4f}")
         model = ensemble
     
     else:
