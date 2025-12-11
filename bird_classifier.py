@@ -397,113 +397,224 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm', use_feature_se
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
     
-    # Optional feature selection
+    # Optional feature selection (helps prevent overfitting by reducing features)
     feature_selector = None
     if use_feature_selection and X_train_scaled.shape[1] > 20:
-        k_best = max(int(0.8 * X_train_scaled.shape[1]), 20)  # Keep top 80% or at least 20 features
+        # Use more aggressive feature selection to prevent overfitting
+        k_best = max(int(0.7 * X_train_scaled.shape[1]), 20)  # Keep top 70% (more aggressive)
         feature_selector = SelectKBest(f_classif, k=k_best)
         X_train_scaled = feature_selector.fit_transform(X_train_scaled, y_train)
         X_val_scaled = feature_selector.transform(X_val_scaled)
-        print(f"  Selected {X_train_scaled.shape[1]} features out of {X_train.shape[1]}")
+        print(f"  Selected {X_train_scaled.shape[1]} features out of {X_train.shape[1]} (reducing overfitting)")
     
     if model_type == 'svm':
-        # Tune C parameter
+        # Tune C parameter with overfitting prevention
         best_score = 0
         best_model = None
         best_C = None
         
-        print("  Tuning C parameter...")
+        print("  Tuning C parameter (preventing overfitting)...")
         for C in [0.1, 1, 10, 100, 1000]:
             model = svm.SVC(kernel='rbf', C=C, gamma='scale', random_state=42, verbose=False)
             model.fit(X_train_scaled, y_train)
-            score = model.score(X_val_scaled, y_val)
-            if score > best_score:
-                best_score = score
+            val_score = model.score(X_val_scaled, y_val)
+            train_score = model.score(X_train_scaled, y_train)
+            
+            # Penalize large train-val gap (overfitting indicator)
+            gap = train_score - val_score
+            combined_score = val_score - 0.2 * gap
+            
+            if combined_score > best_score:
+                best_score = combined_score
                 best_model = model
                 best_C = C
         
-        print(f"  Best C={best_C} with validation accuracy = {best_score:.4f}")
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Best C={best_C} with validation accuracy = {val_acc:.4f}")
+        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
         model = best_model
         
     elif model_type == 'knn':
-        # Tune k parameter
+        # Tune k parameter with overfitting prevention
+        # Use cross-validation and higher minimum k to prevent overfitting
         best_score = 0
         best_model = None
         best_k = None
+        best_weights = None
         
-        print("  Tuning k parameter...")
-        for k in [3, 5, 7, 9, 11, 15, 20, 25]:
-            model = neighbors.KNeighborsClassifier(n_neighbors=k, weights='distance')
-            model.fit(X_train_scaled, y_train)
-            score = model.score(X_val_scaled, y_val)
-            if score > best_score:
-                best_score = score
-                best_model = model
-                best_k = k
+        print("  Tuning k parameter with cross-validation (preventing overfitting)...")
+        # Start from k=7 (higher minimum to prevent overfitting)
+        # Use cross-validation for more robust hyperparameter selection
+        k_values = [7, 9, 11, 13, 15, 17, 20, 25, 30, 35]
+        weight_options = ['distance', 'uniform']  # Try both
         
-        print(f"  Best k={best_k} with validation accuracy = {best_score:.4f}")
+        for weights in weight_options:
+            for k in k_values:
+                model = neighbors.KNeighborsClassifier(
+                    n_neighbors=k, 
+                    weights=weights,
+                    leaf_size=30,  # Larger leaf size for faster computation and less overfitting
+                    algorithm='auto'
+                )
+                # Use cross-validation score for more robust evaluation
+                cv_scores = model_selection.cross_val_score(
+                    model, X_train_scaled, y_train, 
+                    cv=3, scoring='accuracy', n_jobs=-1
+                )
+                cv_mean = cv_scores.mean()
+                
+                # Also check validation set
+                model.fit(X_train_scaled, y_train)
+                val_score = model.score(X_val_scaled, y_val)
+                
+                # Prefer models with good CV score and reasonable train-val gap
+                # Penalize if train accuracy is much higher than val (overfitting)
+                train_score = model.score(X_train_scaled, y_train)
+                gap = train_score - val_score
+                
+                # Combined score: prefer good validation with small gap
+                combined_score = val_score - 0.3 * gap  # Penalize large gaps
+                
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_model = model
+                    best_k = k
+                    best_weights = weights
+        
+        print(f"  Best k={best_k}, weights={best_weights} with validation accuracy = {best_model.score(X_val_scaled, y_val):.4f}")
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Train accuracy: {train_acc:.4f}, Val accuracy: {val_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
         model = best_model
         
     elif model_type == 'rf':
-        print("  Tuning Random Forest...")
+        print("  Tuning Random Forest (preventing overfitting)...")
         best_score = 0
         best_model = None
         best_params = None
         
-        # Try different configurations
+        # Try different configurations with regularization
         for n_est in [100, 200, 300]:
-            for max_d in [20, 30, 40]:
-                model = RandomForestClassifier(n_estimators=n_est, max_depth=max_d,
-                                              random_state=42, n_jobs=-1, verbose=0)
+            for max_d in [15, 20, 25, 30]:  # Reduced max depth to prevent overfitting
+                model = RandomForestClassifier(
+                    n_estimators=n_est, 
+                    max_depth=max_d,
+                    min_samples_split=5,  # Require more samples to split (regularization)
+                    min_samples_leaf=2,    # Require minimum samples in leaf
+                    max_features='sqrt',    # Use sqrt features (regularization)
+                    random_state=42, 
+                    n_jobs=-1, 
+                    verbose=0
+                )
                 model.fit(X_train_scaled, y_train)
-                score = model.score(X_val_scaled, y_val)
-                if score > best_score:
-                    best_score = score
+                val_score = model.score(X_val_scaled, y_val)
+                train_score = model.score(X_train_scaled, y_train)
+                
+                # Penalize large train-val gap
+                gap = train_score - val_score
+                combined_score = val_score - 0.2 * gap
+                
+                if combined_score > best_score:
+                    best_score = combined_score
                     best_model = model
                     best_params = (n_est, max_d)
         
-        print(f"  Best params (n_est={best_params[0]}, max_d={best_params[1]}) with validation accuracy = {best_score:.4f}")
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Best params (n_est={best_params[0]}, max_d={best_params[1]}) with validation accuracy = {val_acc:.4f}")
+        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
         model = best_model
         
     elif model_type == 'gbm':
-        print("  Training Gradient Boosting...")
-        model = GradientBoostingClassifier(n_estimators=100, max_depth=5, 
-                                           learning_rate=0.1, random_state=42, verbose=0)
+        print("  Training Gradient Boosting (with early stopping to prevent overfitting)...")
+        # Use validation set for early stopping
+        model = GradientBoostingClassifier(
+            n_estimators=200,  # Start with more, will stop early
+            max_depth=4,       # Reduced depth to prevent overfitting
+            learning_rate=0.05,  # Lower learning rate for better generalization
+            min_samples_split=5,
+            min_samples_leaf=2,
+            subsample=0.8,     # Use 80% of samples (regularization)
+            max_features='sqrt',
+            validation_fraction=0.1,  # Use 10% for validation
+            n_iter_no_change=10,  # Stop if no improvement for 10 iterations
+            random_state=42, 
+            verbose=0
+        )
         model.fit(X_train_scaled, y_train)
-        score = model.score(X_val_scaled, y_val)
-        print(f"  Validation accuracy = {score:.4f}")
+        train_score = model.score(X_train_scaled, y_train)
+        val_score = model.score(X_val_scaled, y_val)
+        print(f"  Validation accuracy = {val_score:.4f}")
+        print(f"  Train accuracy: {train_score:.4f}, Gap: {train_score - val_score:.4f}")
         
     elif model_type == 'lr':
-        print("  Tuning Logistic Regression...")
+        print("  Tuning Logistic Regression (with regularization)...")
         best_score = 0
         best_model = None
         best_C = None
         
+        # Try different regularization strengths (lower C = more regularization)
         for C in [0.01, 0.1, 1, 10, 100]:
-            model = LogisticRegression(C=C, max_iter=1000, random_state=42, n_jobs=-1)
+            model = LogisticRegression(
+                C=C, 
+                max_iter=1000, 
+                penalty='l2',  # L2 regularization
+                random_state=42, 
+                n_jobs=-1
+            )
             model.fit(X_train_scaled, y_train)
-            score = model.score(X_val_scaled, y_val)
-            if score > best_score:
-                best_score = score
+            val_score = model.score(X_val_scaled, y_val)
+            train_score = model.score(X_train_scaled, y_train)
+            
+            # Prefer models with good validation and small gap
+            gap = train_score - val_score
+            combined_score = val_score - 0.2 * gap
+            
+            if combined_score > best_score:
+                best_score = combined_score
                 best_model = model
                 best_C = C
         
-        print(f"  Best C={best_C} with validation accuracy = {best_score:.4f}")
+        train_acc = best_model.score(X_train_scaled, y_train)
+        val_acc = best_model.score(X_val_scaled, y_val)
+        print(f"  Best C={best_C} with validation accuracy = {val_acc:.4f}")
+        print(f"  Train accuracy: {train_acc:.4f}, Gap: {train_acc - val_acc:.4f}")
         model = best_model
         
     elif model_type == 'ensemble':
-        # Enhanced ensemble with more diverse models
-        print("  Training enhanced ensemble (SVM + KNN + RF + GBM + LR)...")
+        # Enhanced ensemble with more diverse models (regularized to prevent overfitting)
+        print("  Training enhanced ensemble (SVM + KNN + RF + GBM + LR) with overfitting prevention...")
         
-        # Get best hyperparameters from individual models (or use reasonable defaults)
-        svm_model = svm.SVC(kernel='rbf', C=100, gamma='scale', 
+        # Use regularized models to prevent overfitting
+        svm_model = svm.SVC(kernel='rbf', C=10, gamma='scale',  # Lower C for regularization
                            probability=True, random_state=42, verbose=False)
-        knn_model = neighbors.KNeighborsClassifier(n_neighbors=11, weights='distance')
-        rf_model = RandomForestClassifier(n_estimators=200, max_depth=30, 
-                                         random_state=42, n_jobs=-1, verbose=0)
-        gbm_model = GradientBoostingClassifier(n_estimators=100, max_depth=5,
-                                               learning_rate=0.1, random_state=42, verbose=0)
-        lr_model = LogisticRegression(C=10, max_iter=1000, random_state=42, n_jobs=-1)
+        # Use higher k for KNN in ensemble to prevent overfitting
+        knn_model = neighbors.KNeighborsClassifier(
+            n_neighbors=15,  # Higher k to prevent overfitting
+            weights='uniform',  # Uniform weights are less prone to overfitting
+            leaf_size=30
+        )
+        rf_model = RandomForestClassifier(
+            n_estimators=200, 
+            max_depth=25,  # Reduced depth
+            min_samples_split=5,
+            min_samples_leaf=2,
+            max_features='sqrt',
+            random_state=42, 
+            n_jobs=-1, 
+            verbose=0
+        )
+        gbm_model = GradientBoostingClassifier(
+            n_estimators=100, 
+            max_depth=4,  # Reduced depth
+            learning_rate=0.05,
+            subsample=0.8,
+            min_samples_split=5,
+            random_state=42, 
+            verbose=0
+        )
+        lr_model = LogisticRegression(C=1, max_iter=1000, random_state=42, n_jobs=-1)  # Lower C
         
         ensemble = VotingClassifier(
             estimators=[
@@ -526,7 +637,15 @@ def train_model(X_train, y_train, X_val, y_val, model_type='svm', use_feature_se
     
     train_score = model.score(X_train_scaled, y_train)
     val_score = model.score(X_val_scaled, y_val)
-    print(f"  Final - Train accuracy: {train_score:.4f}, Val accuracy: {val_score:.4f}")
+    gap = train_score - val_score
+    
+    print(f"  Final - Train accuracy: {train_score:.4f}, Val accuracy: {val_score:.4f}, Gap: {gap:.4f}")
+    
+    # Warn if overfitting detected
+    if gap > 0.15:
+        print(f"  ⚠️  Warning: Large train-val gap ({gap:.4f}) detected - possible overfitting!")
+    elif gap > 0.10:
+        print(f"  ⚠️  Note: Moderate train-val gap ({gap:.4f}) - monitoring for overfitting")
     
     return model, scaler, feature_selector
 
